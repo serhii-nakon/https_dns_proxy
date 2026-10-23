@@ -1,0 +1,155 @@
+name: Portable release
+
+# Daily: builds the static (portable) binary and a Docker image, but only if the
+# source changed since the last release. The release tag is the build date (YYYY.MM.DD).
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Release even if nothing changed since the last release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: portable-release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    # Scheduled runs always use the default branch; this also stops manual runs on other
+    # branches, so only merged code is released
+    if: >-
+      github.event_name == 'schedule' ||
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+
+    - name: Check for changes since the last release
+      id: check
+      env:
+        GH_TOKEN: ${{ github.token }}
+        FORCE: ${{ inputs.force }}
+      run: |
+        # Only these paths affect the binary or the release assets
+        watched_paths=(src CMakeLists.txt portable .dockerignore)
+
+        last_tag=$(gh release view --json tagName --jq .tagName 2>/dev/null || true)
+        if [ -z "$last_tag" ]; then
+          echo "No previous release"
+          changed=true
+        elif ! git diff --quiet "$last_tag" HEAD -- "${watched_paths[@]}"; then
+          echo "Changes since $last_tag:"
+          git log --oneline "$last_tag"..HEAD -- "${watched_paths[@]}"
+          changed=true
+        else
+          echo "No changes since $last_tag"
+          changed=false
+        fi
+        if [ "$FORCE" = "true" ]; then
+          changed=true
+        fi
+
+        # One release per day; a forced second run on the same day gets a suffix
+        version=$(date -u +%Y.%m.%d)
+        candidate=$version
+        n=1
+        while git rev-parse -q --verify "refs/tags/$candidate" >/dev/null; do
+          n=$((n + 1))
+          candidate="$version.$n"
+        done
+
+        echo "changed=$changed" >> "$GITHUB_OUTPUT"
+        echo "version=$candidate" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set image name
+      run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+    - uses: docker/setup-buildx-action@v3
+
+    - uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+
+    - name: Build portable binary
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: portable/Dockerfile
+        target: binary
+        outputs: type=local,dest=out
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Smoke test
+      run: |
+        file out/https_dns_proxy
+        file out/https_dns_proxy | grep -q 'static'
+        out/https_dns_proxy -V | tee versions.txt
+        grep -q HTTP3 versions.txt
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: portable/Dockerfile
+        target: image
+        push: true
+        tags: |
+          ${{ env.IMAGE }}:${{ env.VERSION }}
+          ${{ env.IMAGE }}:latest
+        labels: |
+          org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          org.opencontainers.image.revision=${{ github.sha }}
+          org.opencontainers.image.version=${{ env.VERSION }}
+          org.opencontainers.image.description=Static https_dns_proxy (DNS-over-HTTPS proxy with HTTP/3) on an empty base image
+        cache-from: type=gha
+
+    - name: Prepare release assets
+      run: |
+        mkdir dist
+        cp out/https_dns_proxy dist/https_dns_proxy-linux-amd64
+        cp portable/https_dns_proxy.service dist/
+        cd dist && sha256sum -- * > SHA256SUMS
+
+    - name: Create release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        {
+          echo "Portable (statically linked) build of https_dns_proxy for Linux x86_64."
+          echo
+          echo '```'
+          cat versions.txt
+          echo '```'
+          echo
+          echo "Docker image: \`docker pull $IMAGE:$VERSION\`"
+          echo
+          echo "See the README section \"Portable binary and Docker image\" for usage."
+        } > notes.md
+        gh release create "$VERSION" dist/* \
+          --target "$GITHUB_SHA" \
+          --title "$VERSION" \
+          --notes-file notes.md
