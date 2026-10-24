@@ -24,13 +24,29 @@
 #
 # Docker image (single layer on top of an empty image):
 #   docker buildx build -f portable/Dockerfile --target image -t https_dns_proxy .
-FROM alpine:3.24 AS build
+#
+# Why commit hashes and digests, not only tags:
+# git tags and Docker tags are mutable. Whoever controls an upstream repository (or an
+# attacker who got access to it) can move a tag to a different commit or image, and the
+# next build would silently use it. A commit hash or an image digest is a hash of the
+# content itself, so it cannot point to anything else. Each library below is cloned by
+# its tag (readable), and the build fails if the tag no longer points to the pinned
+# commit. Git submodules are pinned by the parent commit, so they are covered too.
+# To update a library, change both the tag and the commit, for example:
+#   git ls-remote https://github.com/curl/curl 'refs/tags/curl-8_22_0^{}'
+# To update the base image: docker buildx imagetools inspect alpine:3.24
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS build
 
 ARG OPENSSL_VERSION=openssl-3.6.5
+ARG OPENSSL_COMMIT=c8bd5a57108599ac650bbae77fcabe3109dab2e8
 ARG NGHTTP3_VERSION=v1.18.0
+ARG NGHTTP3_COMMIT=dbfc24286138cb0b6490160e7ca87fe1ce6722a0
 ARG NGTCP2_VERSION=v1.25.0
+ARG NGTCP2_COMMIT=f9e9ff01ad2c8116bc09de4f644b0028a61486a6
 ARG NGHTTP2_VERSION=v1.70.0
+ARG NGHTTP2_COMMIT=85e300c79fb6dbcfa9c1013215c8710c1c2cd3d2
 ARG CURL_VERSION=curl-8_22_0
+ARG CURL_COMMIT=01346829096c61b372692f6dc43ffa778c6caccd
 
 RUN apk add --no-cache build-base linux-headers cmake git perl pkgconf autoconf automake libtool curl \
     libev-dev c-ares-dev ca-certificates
@@ -42,29 +58,37 @@ WORKDIR /usr/src
 
 RUN git clone --depth 1 -b ${OPENSSL_VERSION} https://github.com/openssl/openssl \
  && cd openssl \
+ && test "$(git rev-parse HEAD)" = "${OPENSSL_COMMIT}" \
  && ./config --prefix=$PREFIX --libdir=lib --openssldir=/etc/ssl no-shared no-docs no-tests \
  && make -j$(nproc) && make install_dev
 
 RUN git clone --depth 1 -b ${NGHTTP3_VERSION} https://github.com/ngtcp2/nghttp3 \
- && cd nghttp3 && git submodule update --init --depth 1 \
+ && cd nghttp3 \
+ && test "$(git rev-parse HEAD)" = "${NGHTTP3_COMMIT}" \
+ && git submodule update --init --depth 1 \
  && autoreconf -fi \
  && ./configure --prefix=$PREFIX --enable-lib-only --disable-shared --enable-static \
  && make -j$(nproc) && make install
 
 RUN git clone --depth 1 -b ${NGTCP2_VERSION} https://github.com/ngtcp2/ngtcp2 \
- && cd ngtcp2 && git submodule update --init --depth 1 \
+ && cd ngtcp2 \
+ && test "$(git rev-parse HEAD)" = "${NGTCP2_COMMIT}" \
+ && git submodule update --init --depth 1 \
  && autoreconf -fi \
  && ./configure --prefix=$PREFIX --enable-lib-only --disable-shared --enable-static --with-openssl \
  && make -j$(nproc) && make install
 
 RUN git clone --depth 1 -b ${NGHTTP2_VERSION} https://github.com/nghttp2/nghttp2 \
- && cd nghttp2 && git submodule update --init --depth 1 \
+ && cd nghttp2 \
+ && test "$(git rev-parse HEAD)" = "${NGHTTP2_COMMIT}" \
+ && git submodule update --init --depth 1 \
  && autoreconf -fi \
  && ./configure --prefix=$PREFIX --enable-lib-only --disable-shared --enable-static \
  && make -j$(nproc) && make install
 
 RUN git clone --depth 1 -b ${CURL_VERSION} https://github.com/curl/curl \
  && cd curl \
+ && test "$(git rev-parse HEAD)" = "${CURL_COMMIT}" \
  && autoreconf -fi \
  && ./configure --prefix=$PREFIX --disable-shared --enable-static \
       --with-openssl=$PREFIX --with-nghttp2=$PREFIX --with-ngtcp2=$PREFIX --with-nghttp3=$PREFIX \
