@@ -104,11 +104,15 @@ jobs:
         context: .
         file: portable/Dockerfile
         target: binary
-        outputs: type=local,dest=out
+        # All temporary files go outside the workspace: a new file in the workspace changes
+        # the build context, and the image build below would compile the binary again
+        # (with a different build time) instead of reusing this one
+        outputs: type=local,dest=${{ runner.temp }}/out
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
     - name: Smoke test
+      working-directory: ${{ runner.temp }}
       run: |
         file out/https_dns_proxy
         file out/https_dns_proxy | grep -q 'static'
@@ -132,14 +136,25 @@ jobs:
           org.opencontainers.image.description=Static https_dns_proxy (DNS-over-HTTPS proxy with HTTP/3) on an empty base image
         cache-from: type=gha
 
+    - name: Check that the image has the same binary
+      working-directory: ${{ runner.temp }}
+      run: |
+        docker pull "$IMAGE:$VERSION"
+        container=$(docker create "$IMAGE:$VERSION")
+        docker cp "$container:/https_dns_proxy" image_binary
+        docker rm "$container"
+        cmp out/https_dns_proxy image_binary
+
     - name: Prepare release assets
+      working-directory: ${{ runner.temp }}
       run: |
         mkdir dist
         cp out/https_dns_proxy dist/https_dns_proxy-linux-amd64
-        cp portable/https_dns_proxy.service dist/
+        cp "$GITHUB_WORKSPACE/portable/https_dns_proxy.service" dist/
         cd dist && sha256sum -- * > SHA256SUMS
 
     - name: Create release
+      working-directory: ${{ runner.temp }}
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
@@ -154,7 +169,9 @@ jobs:
           echo
           echo "See the README section \"Portable binary and Docker image\" for usage."
         } > notes.md
+        # --repo is needed because the working directory is not the git checkout
         gh release create "$VERSION" dist/* \
+          --repo "$GITHUB_REPOSITORY" \
           --target "$GITHUB_SHA" \
           --title "$VERSION" \
           --notes-file notes.md
