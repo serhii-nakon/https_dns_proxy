@@ -119,6 +119,39 @@ jobs:
         out/https_dns_proxy -V | tee versions.txt
         grep -q HTTP3 versions.txt
 
+    # Unit tests already ran inside the Docker build. These tests need network access,
+    # dig, valgrind and Robot Framework, so they run here against the built binary.
+    - name: Install test dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends dnsutils valgrind
+        python3 -m venv "$RUNNER_TEMP/venv"
+        "$RUNNER_TEMP/venv/bin/pip" install robotframework
+
+    - name: Integration tests
+      run: |
+        python3 tests/integration/test_tcp_lifecycle.py \
+          --binary "$RUNNER_TEMP/out/https_dns_proxy" --openssl "$(command -v openssl)"
+
+    # Robot and valgrind write logs into the current directory, so the tests run from a
+    # copy outside the workspace (a changed workspace would change the build context)
+    - name: Functional tests
+      run: |
+        cp -r tests/robot "$RUNNER_TEMP/robot"
+        cd "$RUNNER_TEMP/robot"
+        "$RUNNER_TEMP/venv/bin/python3" -m robot.run \
+          --variable "BINARY_PATH:$RUNNER_TEMP/out/https_dns_proxy" \
+          --outputdir "$RUNNER_TEMP/robot-results" \
+          functional_tests.robot
+
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      if: failure()
+      with:
+        name: functional-test-logs
+        path: |
+          ${{ runner.temp }}/robot-results
+          ${{ runner.temp }}/robot/valgrind-*.log
+
     - name: Build and push Docker image
       uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
       with:
@@ -126,9 +159,8 @@ jobs:
         file: portable/Dockerfile
         target: image
         push: true
-        tags: |
-          ${{ env.IMAGE }}:${{ env.VERSION }}
-          ${{ env.IMAGE }}:latest
+        # "latest" is added only after the image passes the checks below
+        tags: ${{ env.IMAGE }}:${{ env.VERSION }}
         labels: |
           org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           org.opencontainers.image.revision=${{ github.sha }}
@@ -144,6 +176,24 @@ jobs:
         docker cp "$container:/https_dns_proxy" image_binary
         docker rm "$container"
         cmp out/https_dns_proxy image_binary
+
+    # The resolver is given by hostname, so this also checks the bundled CA certificates
+    # and /etc/services, which only the image provides
+    - name: Image test
+      run: |
+        docker run -d --name image_test -p 127.0.0.1:5053:5053/udp -p 127.0.0.1:5053:5053/tcp \
+          "$IMAGE:$VERSION" -4 -v -v -v -r https://cloudflare-dns.com/dns-query
+        sleep 3
+        status=0
+        dig +tries=3 +time=5 @127.0.0.1 -p 5053 example.com | grep -q 'status: NOERROR' || status=1
+        dig +tcp +tries=3 +time=5 @127.0.0.1 -p 5053 example.com | grep -q 'status: NOERROR' || status=1
+        docker logs image_test
+        docker rm -f image_test
+        exit "$status"
+
+    - name: Tag image as latest
+      # Copies the tag in the registry, keeping the same digest and attestations
+      run: docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$VERSION"
 
     - name: Prepare release assets
       working-directory: ${{ runner.temp }}
