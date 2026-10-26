@@ -102,13 +102,17 @@ RUN git clone --depth 1 -b ${CURL_VERSION} https://github.com/curl/curl \
 COPY . /usr/src/https_dns_proxy
 WORKDIR /usr/src/https_dns_proxy
 
-# libsystemd has no static library, so the build goes without sd_notify support
+# libsystemd has no static library, so the build goes without sd_notify support.
+# Unit tests are built with the same static libraries as the binary and must pass,
+# otherwise the build fails. Tests that need network or root run in CI instead.
 RUN cmake . -DUSE_CLANG_TIDY=OFF \
+      -DBUILD_TESTING=ON \
       -DCMAKE_PREFIX_PATH=$PREFIX \
       -DCUSTOM_LIBCURL_INSTALL_PATH=$PREFIX \
       -DCMAKE_EXE_LINKER_FLAGS="-static" \
       -DCMAKE_C_STANDARD_LIBRARIES="$(pkg-config --static --libs libcurl libcares)" \
  && make -j$(nproc) \
+ && ctest -L unit --output-on-failure \
  && strip https_dns_proxy
 
 # Everything the image needs is gathered in one directory, so it is copied as a single layer.
